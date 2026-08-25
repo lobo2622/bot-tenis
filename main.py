@@ -1,6 +1,8 @@
 import os
 import json
+import io
 import requests
+import pandas as pd
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 
@@ -16,57 +18,34 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_token_secreto_tenis")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Base de datos local derivada de tu Google Sheets
-INVENTARIO = [
-    {
-        "ID": "TNS-1",
-        "Marca": "Reebok",
-        "Modelo": "Tenis court retro",
-        "Diseño": "Casual",
-        "Color": "Blanco",
-        "Tallas_Disponibles": ["25"],
-        "Precio_MXN": 700,
-        "Link_Foto": "https://drive.google.com/file/d/1pefzjfv3JbZY5Ye1W1E0BRh-ZtuwxrP8/view?usp=sharing",
-        "Estado": "Disponible"
-    },
-    {
-        "ID": "TNS-2",
-        "Marca": "Reebok",
-        "Modelo": "Tenis detalles a contraste",
-        "Diseño": "Sport",
-        "Color": "Negro",
-        "Tallas_Disponibles": ["25"],
-        "Precio_MXN": 700,
-        "Link_Foto": "https://drive.google.com/file/d/1p4iauxnVq7fo3B9ykKjuInHPN4S0MA55/view?usp=drive_link",
-        "Estado": "Disponible"
-    }
-]
+# Enlace de tu base de datos en Google Sheets convertida a formato de descarga directa CSV
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1VuEgzEqKc2SExRap6JXfgyhx2v7OJom3/export?format=csv"
 
-SYSTEM_PROMPT = f"""
+def obtener_inventario():
+    try:
+        response = requests.get(SHEET_URL)
+        if response.status_code == 200:
+            df = pd.read_csv(io.StringIO(response.text))
+            # Limpiar filas vacías
+            df = df.dropna(subset=['ID'])
+            return df.to_dict(orient='records')
+    except Exception as e:
+        print(f"Error al leer Google Sheets: {e}")
+    return []
+
+SYSTEM_PROMPT_BASE = """
 Eres el asistente virtual amigable y profesional de la tienda de tenis.
-Tu objetivo es ayudar a los clientes a encontrar pares disponibles, resolver dudas sobre compras y facilitar el proceso de pago/entrega.
+Tu objetivo es ayudar a los clientes a encontrar pares disponibles según su talla, marca o modelo, resolver dudas sobre compras y facilitar el pago o entrega.
 
-INVENTARIO ACTUAL EN TIEMPO REAL:
-{json.dumps(INVENTARIO, ensure_ascii=False, indent=2)}
+REGLAS DEL NEGOCIO:
+1. Métodos de Pago: Efectivo, transferencia o tarjeta con terminal Mercado Pago.
+2. Entregas: Sin costo en El Salto (radio de 10 km). Fuera de ahí, $50 MXN adicionales.
+3. Apartados: A 30 días abonando desde el 30%.
+4. Cambios: Solo por talla y con calzado impecable y sin usar.
 
-REGLAS Y POLÍTICAS DEL NEGOCIO:
-1. Métodos de Pago:
-   - Efectivo.
-   - Transferencia bancaria.
-   - Pago con tarjeta presencial mediante terminal Mercado Pago (aceptamos todas las tarjetas de crédito, débito y vales de despensa).
-2. Entregas y Envíos:
-   - Entrega sin costo adicional en El Salto dentro de un radio de 10 km.
-   - Envíos a zonas fuera de los 10 km en El Salto o alrededores: $50 MXN adicionales.
-3. Sistema de Apartado:
-   - Puedes apartar cualquier par a 30 días abonando desde un 30% del costo total.
-4. Cambios y Devoluciones:
-   - Aceptamos cambios únicamente por talla.
-   - Requisito obligatorio: El calzado debe devolverse impecable, nuevo, sin usar y en las mismas condiciones entregadas.
-
-INSTRUCCIONES DE RESPUESTA:
+INSTRUCCIONES:
 - Responde de forma concisa, educada y natural por WhatsApp.
-- Si preguntan por un modelo o talla, consulta el INVENTARIO. Si está disponible, menciona el precio y comparte el Link_Foto correspondiente para que puedan verlo.
-- Si solicitan comprar o apartar, confirma los detalles e indícales los pasos para realizar el pago o la entrega.
+- Si preguntan por modelos o tallas, revisa estrictamente el inventario actual, da el precio y comparte el Link_Foto si está disponible.
 """
 
 @app.route("/webhook", methods=["GET"])
@@ -79,32 +58,48 @@ def verify_webhook():
         if mode == "subscribe" and token == VERIFY_TOKEN:
             return challenge, 200
         return "Forbidden", 403
-    return "Bad Request", 400
+    return "Verificación exitosa del Webhook", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    if data.get("object") == "whatsapp_business_account":
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                if messages:
-                    msg = messages[0]
-                    from_number = msg.get("from")
-                    
-                    if msg.get("type") == "text":
-                        user_text = msg.get("text", {}).get("body", "")
+    try:
+        data = request.json
+        print("Datos recibidos de WhatsApp:", json.dumps(data, indent=2))
+        
+        if data.get("object") == "whatsapp_business_account":
+            for entry in data.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    messages = value.get("messages", [])
+                    if messages:
+                        msg = messages[0]
+                        from_number = msg.get("from")
                         
-                        # Generar respuesta con Gemini
-                        chat = model.start_chat(history=[])
-                        full_prompt = f"{SYSTEM_PROMPT}\n\nCliente dice: {user_text}"
-                        response = chat.send_message(full_prompt)
-                        bot_reply = response.text
-                        
-                        # Enviar respuesta a WhatsApp Meta API
-                        send_whatsapp_message(from_number, bot_reply)
-                        
+                        if msg.get("type") == "text":
+                            user_text = msg.get("text", {}).get("body", "")
+                            
+                            # Cargar inventario actualizado desde tu Google Sheet
+                            inventario_actual = obtener_inventario()
+                            
+                            prompt_dinamico = f"""
+{SYSTEM_PROMPT_BASE}
+
+INVENTARIO ACTUALIZADO:
+{json.dumps(inventario_actual, ensure_ascii=False, indent=2)}
+
+Cliente dice: {user_text}
+"""
+                            # Generar respuesta con Gemini
+                            chat = model.start_chat(history=[])
+                            response = chat.send_message(prompt_dinamico)
+                            bot_reply = response.text
+                            
+                            # Enviar respuesta automática por la API de Meta
+                            send_whatsapp_message(from_number, bot_reply)
+                            
+    except Exception as e:
+        print(f"Error procesando el mensaje: {e}")
+        
     return jsonify({"status": "ok"}), 200
 
 def send_whatsapp_message(to_number, text):
@@ -119,7 +114,8 @@ def send_whatsapp_message(to_number, text):
         "type": "text",
         "text": {"body": text}
     }
-    requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers)
+    print("Respuesta de envío a WhatsApp:", response.text)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
